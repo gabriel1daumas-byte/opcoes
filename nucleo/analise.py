@@ -162,6 +162,19 @@ def scanner_travas(df, S, du, r, sig, min_neg=10, faixa=0.2, max_larg=None):
 
 
 # ---------------------------------------------------------------- alto risco / multiplicador
+def classificar_meta(prob):
+    """Rótulo de quão realista é bater a meta, pela probabilidade estimada."""
+    if prob is None or not np.isfinite(prob) or prob < 0.001:
+        return "Praticamente impossível"
+    if prob < 0.01:
+        return "Muito ousado"
+    if prob < 0.05:
+        return "Ousado"
+    if prob < 0.20:
+        return "Possível"
+    return "Realista"
+
+
 def scanner_multiplicador(df, S, du, r, sig, capital, mult, min_neg=10, lote=100):
     """Para cada opção: quanto a ação precisa andar para o prêmio multiplicar por `mult`
     (hoje e no vencimento) e a probabilidade estimada disso, com a vol `sig`."""
@@ -195,10 +208,15 @@ def scanner_multiplicador(df, S, du, r, sig, capital, mult, min_neg=10, lote=100
             s_hoje, prob_hoje = np.nan, 0.0
         qtd = int(capital // (p * lote)) * lote
         valor_justo = preco_bs(S, K, T, r, sig, t)
+        # cenário realista: ação anda 1 desvio típico do dia a favor
+        s_1dp = S * np.exp(sd_dia if call else -sd_dia)
+        mult_1dp = preco_bs(s_1dp, K, T1, r, iv, t) / p
         linhas.append(dict(
             codigo=o["codigo"], tipo=t, strike=K, preco=p, negocios=o["negocios"], iv=iv,
             qtd=qtd, custo=qtd * p,
             mov_hoje=s_hoje / S - 1 if np.isfinite(s_hoje) else np.nan, prob_hoje=prob_hoje,
             mov_venc=s_venc / S - 1, prob_venc=prob_venc, prob_lucro_venc=prob_lucro,
-            retorno_esperado=valor_justo / p - 1))
+            retorno_esperado=valor_justo / p - 1,
+            meta_hoje=classificar_meta(prob_hoje), meta_venc=classificar_meta(prob_venc),
+            mult_realista=mult_1dp, valor_realista=qtd * p * mult_1dp))
     return pd.DataFrame(linhas)

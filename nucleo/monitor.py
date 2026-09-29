@@ -126,7 +126,9 @@ def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo
                      trava_ve_risco=float(top_tr.iloc[0]["ve_por_risco"]) if len(top_tr) else np.nan,
                      trava_prob=float(top_tr.iloc[0]["prob_lucro"]) if len(top_tr) else np.nan,
                      risco_melhor=top_ar.iloc[0]["codigo"] if len(top_ar) else "",
-                     risco_prob_hoje=float(top_ar.iloc[0]["prob_hoje"]) if len(top_ar) else np.nan)
+                     risco_prob_hoje=float(top_ar.iloc[0]["prob_hoje"]) if len(top_ar) else np.nan,
+                     risco_meta=top_ar.iloc[0]["meta_hoje"] if len(top_ar) else "",
+                     risco_valor_realista=float(top_ar.iloc[0]["valor_realista"]) if len(top_ar) else np.nan)
         liq_n = np.log10(max(linha["negocios"], 1)) / 4
         vol_n = min(abs(np.log(razao)) / np.log(1.5), 1) if np.isfinite(razao) else 0
         tr_n = min(max(linha["trava_ve_risco"], 0) / 0.3, 1) if np.isfinite(linha["trava_ve_risco"]) else 0
@@ -185,6 +187,13 @@ def comparar(atual, anterior, ops_atual, ops_anterior):
     return alertas
 
 
+CHANCE_MIN_ALERTA = 0.005   # só alerta séries com pelo menos 0,5% de chance hoje
+
+
+def fmt_chance(p):
+    return "< 0,01%" if p < 0.0001 else f"{p:.2%}".replace(".", ",")
+
+
 def comparar_risco(atual, anterior):
     """Alertas da aba Alto risco: chance de bater a meta subindo, séries novas no top 10."""
     al = []
@@ -193,15 +202,18 @@ def comparar_risco(atual, anterior):
     a = atual.head(10).set_index("codigo")
     b = anterior.set_index("codigo")
     for c, x in a.iterrows():
+        if x["prob_hoje"] < CHANCE_MIN_ALERTA:
+            continue          # chance desprezível: não vale alerta
         if c not in b.index:
-            al.append((x["ativo"], f"{c} entrou no top 10 (chance hoje {x['prob_hoje']:.2%}, prêmio R$ {x['preco']:.2f})"))
+            al.append((x["ativo"], f"{c} entrou no top 10 (chance hoje {fmt_chance(x['prob_hoje'])}, "
+                                   f"prêmio R$ {x['preco']:.2f})"))
             continue
         y = b.loc[c]
         if isinstance(y, pd.DataFrame):
             y = y.iloc[0]
         dp = x["prob_hoje"] - y["prob_hoje"]
         if dp >= 0.005:
-            al.append((x["ativo"], f"{c}: chance de bater a meta hoje subiu {y['prob_hoje']:.2%} → {x['prob_hoje']:.2%}"))
+            al.append((x["ativo"], f"{c}: chance de bater a meta hoje subiu {fmt_chance(y['prob_hoje'])} → {fmt_chance(x['prob_hoje'])}"))
         if y["preco"] > 0 and abs(x["preco"] / y["preco"] - 1) >= 0.25:
             al.append((x["ativo"], f"{c}: prêmio {x['preco'] / y['preco'] - 1:+.0%} (R$ {y['preco']:.2f} → R$ {x['preco']:.2f})"))
     return al

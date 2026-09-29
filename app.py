@@ -53,6 +53,8 @@ selic = st.sidebar.number_input("Selic (% a.a.)", 0.0, 50.0, float(selic_auto), 
 r = float(np.log(1 + selic / 100))  # taxa contínua
 min_neg = st.sidebar.number_input("Mínimo de negócios no dia", 0, 10000, 10, 5,
                                   help="Filtra opções sem liquidez (preço pode estar velho).")
+so_opcoes = st.sidebar.toggle("Só opções (sem operar ações)", True,
+                              help="Esconde venda coberta, venda de put para comprar a ação e estruturas com ações.")
 capital_g = st.sidebar.number_input("Capital para alto risco (R$)", 10.0, 1e7, 697.0, 10.0)
 meta_g = st.sidebar.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0)
 st.sidebar.caption("Ferramenta de estudo. Não é recomendação de investimento. "
@@ -61,10 +63,21 @@ st.sidebar.caption("Ferramenta de estudo. Não é recomendação de investimento
 
 
 def fmt_tabela(df, pct=(), money=(), num=()):
+    if "vencimento" in df:
+        df = df.copy()
+        df["vencimento"] = pd.to_datetime(df["vencimento"], errors="coerce").dt.strftime("%d/%m/%Y")
     f = {c: "{:.1%}" for c in pct if c in df}
     f.update({c: "R$ {:,.2f}" for c in money if c in df})
     f.update({c: "{:.3f}" for c in num if c in df})
-    return df.style.format(f, na_rep="—")
+    if "mult_realista" in df:
+        f["mult_realista"] = "{:.1f}x"
+    sty = df.style.format(f, na_rep="—")
+    cores = {"Realista": "#2e9e5b", "Possível": "#7cb342", "Ousado": "#e8833a",
+             "Muito ousado": "#d64545", "Praticamente impossível": "#8a8f98"}
+    metas = [c for c in df.columns if c in ("meta_hoje", "meta_venc", "risco_meta")]
+    if metas:
+        sty = sty.map(lambda v: f"color: {cores.get(v, 'inherit')}; font-weight: 600", subset=metas)
+    return sty
 
 
 # ================================================================ abas principais
@@ -182,14 +195,19 @@ def painel_monitor():
     tabela_alertas(ss["alertas"], "Os alertas aparecem a partir da segunda leitura de cada ativo (preço ±1%, "
                                   "IV ±2 p.p., mudança de sinal de vol, salto de negócios, nota subindo).")
     st.markdown("**Ranking de oportunidades**")
-    cols = ["ativo", "nota", "lido_as", "preco", "du", "negocios", "iv_atm", "hv21", "iv_hv", "sinal",
-            "renda_melhor", "renda_taxa_aa", "trava_melhor", "trava_ve_risco", "trava_prob"]
-    st.dataframe(fmt_tabela(res[cols], pct=["iv_atm", "hv21", "renda_taxa_aa", "trava_prob"],
-                            money=["preco"], num=["iv_hv", "trava_ve_risco"]),
+    cols = ["ativo", "vencimento", "nota", "lido_as", "preco", "du", "negocios", "iv_atm", "hv21", "iv_hv", "sinal",
+            "renda_melhor", "renda_taxa_aa", "trava_melhor", "trava_ve_risco", "trava_prob",
+            "risco_melhor", "risco_meta", "risco_prob_hoje", "risco_valor_realista"]
+    if so_opcoes:
+        cols = [c_ for c_ in cols if not c_.startswith("renda_")]
+    st.dataframe(fmt_tabela(res[cols], pct=["iv_atm", "hv21", "renda_taxa_aa", "trava_prob", "risco_prob_hoje"],
+                            money=["preco", "risco_valor_realista"], num=["iv_hv", "trava_ve_risco"]),
                  hide_index=True, width="stretch", height=420)
     st.caption("**nota** 0–100: liquidez + distância entre IV e vol histórica + qualidade da melhor trava "
                "(valor esperado por R$ de risco, usando a HV). **sinal**: IV/HV > 1,2 favorece vender prêmio; "
                "< 0,8 favorece comprar. **lido_as**: horário do dado daquele ativo. "
+               "**risco_meta**: quão realista é bater a meta hoje na melhor opção de alto risco; "
+               "**risco_valor_realista**: quanto o capital viraria nela com um movimento típico do dia. "
                "Para detalhar um ativo, use a barra lateral e a aba Outros menus.")
     hist_iv = [l[1].assign(hora=l[0]) for l in ss["leituras"] if not l[1].empty]
     if len(hist_iv) >= 2:
@@ -221,7 +239,7 @@ def painel_risco():
         return
     best = rk.iloc[0]
     k = st.columns(3)
-    k[0].metric("Melhor chance de bater a meta HOJE", f"{best['prob_hoje']:.2%}", f"{best['codigo']} ({best['ativo']})",
+    k[0].metric("Melhor chance de bater a meta HOJE", monitor.fmt_chance(best["prob_hoje"]), f"{best['codigo']} ({best['ativo']})",
                 delta_color="off")
     k[1].metric("Melhor chance até o vencimento", f"{rk['prob_venc'].max():.2%}")
     k[2].metric("Retorno esperado mediano (modelo)", f"{rk['retorno_esperado'].median():+.0%}")
@@ -229,18 +247,25 @@ def painel_risco():
         st.info(f"Na melhor opção de todos os ativos, a chance de bater a meta hoje é ≈ 1 em "
                 f"{1 / best['prob_hoje']:,.0f}. Na grande maioria das vezes, o capital inteiro é perdido.")
     st.markdown("**Alertas de alto risco**")
-    tabela_alertas(ss["alertas_risco"], "Aparecem a partir da segunda leitura: chance subindo, série nova no "
-                                        "top 10, prêmio variando ±25%.")
+    tabela_alertas(ss["alertas_risco"], "Aparecem a partir da segunda leitura, só para séries com chance de pelo "
+                                        "menos 0,5% hoje: chance subindo, série nova no top 10, prêmio ±25%.")
+    if best["prob_hoje"] < monitor.CHANCE_MIN_ALERTA:
+        st.warning("Nenhuma opção tem chance relevante (≥ 0,5%) de bater a meta hoje. Com a meta atual, o movimento "
+                   "necessário é grande demais para um pregão.")
     st.markdown("**Ranking (todas as séries, todos os ativos)**")
-    cols = ["ativo", "codigo", "tipo", "strike", "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje",
+    cols = ["ativo", "codigo", "vencimento", "meta_hoje", "valor_realista", "mult_realista", "tipo", "strike",
+            "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje", "meta_venc",
             "mov_venc", "prob_venc", "prob_lucro_venc", "retorno_esperado", "iv", "preco_ativo", "du"]
     st.dataframe(fmt_tabela(rk[cols], pct=["mov_hoje", "prob_hoje", "mov_venc", "prob_venc", "prob_lucro_venc",
                                             "retorno_esperado", "iv"],
-                            money=["strike", "preco", "custo", "preco_ativo"]),
+                            money=["strike", "preco", "custo", "preco_ativo", "valor_realista"],
+                            num=["mult_realista"]),
                  hide_index=True, width="stretch", height=460)
-    st.caption("**mov_hoje**: quanto a ação precisa andar até o fechamento de hoje para a opção valer a meta. "
+    st.caption("**meta_hoje / meta_venc**: Realista (≥20% de chance), Possível (5–20%), Ousado (1–5%), Muito ousado (0,1–1%), Praticamente impossível (<0,1%). **valor_realista / mult_realista**: quanto o capital viraria nessa opção se a ação andar um movimento típico do dia a favor. "
+               "**mov_hoje**: quanto a ação precisa andar até o fechamento de hoje para a opção valer a meta. "
                "**prob_hoje / prob_venc**: chance estimada (log-normal). **retorno_esperado**: valor teórico ÷ "
-               "preço − 1 (negativo = opção cara). Preço = último negócio; confira o book. Sem custos e IR.")
+               "preço − 1 (negativo = opção cara). Preço = último negócio; confira o book. Sem custos e IR. "
+               "**Zere a posição antes do vencimento: opção dentro do dinheiro no vencimento é exercida e vira compra ou venda de ações.**")
 
 
 with top[0]:
@@ -370,7 +395,7 @@ aba = [None] + list(OUT.tabs(["Grade de opções", "Volatilidade", "Scanner de r
 with aba[1]:
     so_liq = st.checkbox("Mostrar só opções com liquidez", True)
     base = g[g["negocios"] >= min_neg] if so_liq else g
-    cols = ["codigo", "strike", "preco", "negocios", "iv", "delta", "gama", "theta", "vega",
+    cols = ["codigo", "vencimento", "strike", "preco", "negocios", "iv", "delta", "gama", "theta", "vega",
             "prob_exerc", "dist_pct", "valor_extr", "modelo"]
     l, rr = st.columns(2)
     for col, tipo in ((l, "CALL"), (rr, "PUT")):
@@ -424,7 +449,7 @@ with aba[2]:
 
     st.subheader("Opções mais caras e mais baratas vs. volatilidade histórica")
     if hv21 and not liq.empty:
-        x = liq[["codigo", "tipo", "strike", "preco", "negocios", "iv", "iv_hv", "delta"]].sort_values("iv_hv")
+        x = liq[["codigo", "vencimento", "tipo", "strike", "preco", "negocios", "iv", "iv_hv", "delta"]].sort_values("iv_hv")
         a, b = st.columns(2)
         a.caption("Mais baratas (IV/HV menor) — candidatas a compra")
         a.dataframe(fmt_tabela(x.head(10), pct=["iv"], money=["strike", "preco"], num=["iv_hv", "delta"]),
@@ -435,27 +460,32 @@ with aba[2]:
 
 # ================================================================ 3. scanner de renda
 with aba[3]:
-    st.subheader("Venda coberta e venda de put")
-    f1, f2, f3 = st.columns(3)
-    faixa_delta = f1.slider("|Delta| (≈ chance de exercício)", 0.0, 1.0, (0.15, 0.45), 0.05)
-    ordem = f2.selectbox("Ordenar por", ["taxa_aa", "taxa", "prob_ficar", "protecao", "iv_hv"])
-    tipo_r = f3.multiselect("Estratégia", ["Venda coberta", "Venda de put"],
-                            ["Venda coberta", "Venda de put"])
-    ren = scanner_renda(g, S, du, min_neg)
-    ren = ren[ren["delta"].abs().between(*faixa_delta) & ren["estrategia"].isin(tipo_r)]
-    ren = ren.sort_values(ordem, ascending=False)
-    cols = ["estrategia", "codigo", "strike", "preco", "negocios", "dist_pct", "taxa", "taxa_aa",
-            "retorno_exercido", "protecao", "preco_efetivo", "prob_ficar", "iv", "iv_hv", "delta"]
-    st.dataframe(fmt_tabela(ren[cols], pct=["dist_pct", "taxa", "taxa_aa", "retorno_exercido", "protecao",
-                                            "prob_ficar", "iv"],
-                            money=["strike", "preco", "preco_efetivo"], num=["iv_hv", "delta"]),
-                 hide_index=True, width="stretch", height=480)
-    selic_per = (1 + selic / 100) ** (du / DIAS_ANO) - 1
-    st.caption(f"**taxa**: valor extrínseco / capital (o que você ganha se o preço não mudar). "
-               f"**taxa_aa**: anualizada — compare com a Selic de {selic:.2f}% a.a. "
-               f"(≈ {selic_per:.2%} no período). **proteção**: queda que o prêmio absorve (venda coberta) "
-               f"ou desconto do preço de compra efetivo vs. hoje (put). **prob_ficar**: chance, pelo modelo, "
-               f"de a opção virar pó e você ficar com o prêmio.")
+    if so_opcoes:
+        st.info("Venda coberta e venda de put para comprar a ação envolvem **ações**, então ficam ocultas no modo "
+                "\"Só opções\". Desligue a opção na barra lateral para vê-las. Para operar só opções, use o "
+                "**Scanner de travas** e o **Montador**.")
+    else:
+        st.subheader("Venda coberta e venda de put")
+        f1, f2, f3 = st.columns(3)
+        faixa_delta = f1.slider("|Delta| (≈ chance de exercício)", 0.0, 1.0, (0.15, 0.45), 0.05)
+        ordem = f2.selectbox("Ordenar por", ["taxa_aa", "taxa", "prob_ficar", "protecao", "iv_hv"])
+        tipo_r = f3.multiselect("Estratégia", ["Venda coberta", "Venda de put"],
+                                ["Venda coberta", "Venda de put"])
+        ren = scanner_renda(g, S, du, min_neg)
+        ren = ren[ren["delta"].abs().between(*faixa_delta) & ren["estrategia"].isin(tipo_r)]
+        ren = ren.sort_values(ordem, ascending=False)
+        cols = ["estrategia", "codigo", "vencimento", "strike", "preco", "negocios", "dist_pct", "taxa", "taxa_aa",
+                "retorno_exercido", "protecao", "preco_efetivo", "prob_ficar", "iv", "iv_hv", "delta"]
+        st.dataframe(fmt_tabela(ren[cols], pct=["dist_pct", "taxa", "taxa_aa", "retorno_exercido", "protecao",
+                                                "prob_ficar", "iv"],
+                                money=["strike", "preco", "preco_efetivo"], num=["iv_hv", "delta"]),
+                     hide_index=True, width="stretch", height=480)
+        selic_per = (1 + selic / 100) ** (du / DIAS_ANO) - 1
+        st.caption(f"**taxa**: valor extrínseco / capital (o que você ganha se o preço não mudar). "
+                   f"**taxa_aa**: anualizada — compare com a Selic de {selic:.2f}% a.a. "
+                   f"(≈ {selic_per:.2%} no período). **proteção**: queda que o prêmio absorve (venda coberta) "
+                   f"ou desconto do preço de compra efetivo vs. hoje (put). **prob_ficar**: chance, pelo modelo, "
+                   f"de a opção virar pó e você ficar com o prêmio.")
 
 # ================================================================ 4. scanner de travas
 with aba[4]:
@@ -483,6 +513,7 @@ with aba[4]:
         st.info("Nenhuma trava encontrada com os filtros atuais (tente reduzir o mínimo de negócios).")
     else:
         tr = tr[tr["estrategia"].isin(tipos_t)].sort_values(ord_t, ascending=False)
+        tr.insert(3, "vencimento", venc["data"])
         st.caption(f"{len(tr)} combinações · vol usada: {PCT(sig_t)} · valores por unidade (×100 por lote)")
         st.dataframe(fmt_tabela(tr.head(200), pct=["prob_lucro"],
                                 money=["k_menor", "k_maior", "largura", "fluxo_inicial", "ganho_max",
@@ -527,16 +558,21 @@ def montar_modelo(nome):
 with aba[5]:
     st.subheader("Montador de estratégias")
     a, b, c3 = st.columns([2, 1, 1])
+    if so_opcoes:
+        MODELOS = {k_: v_ for k_, v_ in MODELOS.items() if all(p_[0] != "ACAO" for p_ in v_)}
     modelo = a.selectbox("Modelo inicial", list(MODELOS))
     lotes = b.number_input("Lotes (×100)", 1, 1000, 1)
     sig_m = c3.number_input("Vol. p/ probabilidades (%)", 1.0, 300.0, round(iv_atm * 100, 1)) / 100
+    if so_opcoes:
+        st.warning("Zere a posição antes do vencimento: opção dentro do dinheiro no vencimento é exercida e vira compra ou venda de ações. Posições vendidas (strangle, venda de put, travas de crédito) também podem ser exercidas "
+                   "antes, se forem americanas, e exigem margem na corretora.")
     st.caption("Edite as pernas à vontade: qtd positiva = compra, negativa = venda. "
                "Troque o strike/prêmio ou adicione linhas.")
     chave = f"pernas_{modelo}_{venc['data']}_{ticker}"
     ed = st.data_editor(
         montar_modelo(modelo), key=chave, num_rows="dynamic", width="stretch", hide_index=True,
         column_config={
-            "tipo": st.column_config.SelectboxColumn("tipo", options=["CALL", "PUT", "ACAO"], required=True),
+            "tipo": st.column_config.SelectboxColumn("tipo", options=["CALL", "PUT"] if so_opcoes else ["CALL", "PUT", "ACAO"], required=True),
             "qtd": st.column_config.NumberColumn("qtd", step=1),
             "strike": st.column_config.NumberColumn("strike", format="%.2f"),
             "premio": st.column_config.NumberColumn("prêmio / preço", format="%.2f"),
@@ -632,13 +668,16 @@ with aba[6]:
             um_em = f"≈ 1 em {1 / best_h:,.0f}" if best_h > 0 else "praticamente nula"
             st.info(f"Na melhor opção, a chance de bater a meta hoje é {um_em}. "
                     f"Ou seja: se você fizesse essa aposta muitas vezes, na grande maioria perderia o capital inteiro.")
-            cols = ["codigo", "tipo", "strike", "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje",
-                    "mov_venc", "prob_venc", "prob_lucro_venc", "retorno_esperado", "iv"]
+            ar["vencimento"] = venc["data"]
+            cols = ["codigo", "vencimento", "meta_hoje", "valor_realista", "mult_realista", "tipo", "strike", "preco",
+                    "negocios", "qtd", "custo", "mov_hoje", "prob_hoje", "meta_venc", "mov_venc", "prob_venc",
+                    "prob_lucro_venc", "retorno_esperado", "iv"]
             st.dataframe(fmt_tabela(ar[cols], pct=["mov_hoje", "prob_hoje", "mov_venc", "prob_venc",
                                                    "prob_lucro_venc", "retorno_esperado", "iv"],
-                                    money=["strike", "preco", "custo"]),
+                                    money=["strike", "preco", "custo", "valor_realista"], num=["mult_realista"]),
                          hide_index=True, width="stretch", height=460)
-            st.caption("**mov_hoje**: quanto a ação precisa subir (call) ou cair (put) até o fechamento de hoje "
+            st.caption("**meta_hoje / meta_venc**: Realista (≥20% de chance), Possível (5–20%), Ousado (1–5%), Muito ousado (0,1–1%), Praticamente impossível (<0,1%). **valor_realista / mult_realista**: quanto o capital viraria nessa opção se a ação andar um movimento típico do dia a favor. "
+                       "**mov_hoje**: quanto a ação precisa subir (call) ou cair (put) até o fechamento de hoje "
                        "para a opção valer a meta, mantendo a IV. **prob_hoje / prob_venc**: chance estimada pela "
                        "distribuição log-normal. **prob_lucro_venc**: chance de terminar acima do custo no vencimento. "
                        "**retorno_esperado**: valor teórico com a vol escolhida ÷ preço − 1 (negativo = opção cara). "
