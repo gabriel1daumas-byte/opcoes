@@ -55,11 +55,14 @@ min_neg = st.sidebar.number_input("Mínimo de negócios no dia", 0, 10000, 10, 5
                                   help="Filtra opções sem liquidez (preço pode estar velho).")
 so_opcoes = st.sidebar.toggle("Só opções (sem operar ações)", True,
                               help="Esconde venda coberta, venda de put para comprar a ação e estruturas com ações.")
-capital_g = st.sidebar.number_input("Capital para alto risco (R$)", 10.0, 1e7, 697.0, 10.0)
-meta_g = st.sidebar.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0)
 st.sidebar.caption("Ferramenta de estudo. Não é recomendação de investimento. "
                    "Custos de corretagem, emolumentos e IR não estão incluídos.")
 
+
+
+def br(v, casas=2):
+    """Número no formato brasileiro: 5.000,00"""
+    return f"{v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def fmt_tabela(df, pct=(), money=(), num=()):
@@ -116,6 +119,13 @@ with top[0]:
     por_rodada = m3.number_input("Ativos por rodada", 1, 30, 5,
                                  help="O site gratuito bloqueia muitas consultas seguidas (HTTP 429). "
                                       "O app atualiza alguns ativos por rodada, em rodízio.")
+with top[1]:
+    st.subheader("Alto risco — todas as oportunidades de multiplicar o capital")
+    ca, cb, cc = st.columns([1, 1, 2])
+    capital_g = ca.number_input("Capital (R$)", 10.0, 1e7, 697.0, 10.0, key="capital_g")
+    meta_g = cb.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0, key="meta_g")
+    cc.markdown(f"<div style='padding-top:2rem'>Precisa multiplicar por <b>{meta_g / capital_g:.1f}x</b></div>",
+                unsafe_allow_html=True)
 ATIVOS = [a.strip().upper() for a in ativos_txt.replace(";", ",").split(",") if a.strip()]
 
 
@@ -124,8 +134,14 @@ def garantir_leitura(forcar=False):
     agora = datetime.now(TZ)
     ult = ss["leituras"][-1][0] if ss["leituras"] else None
     velha = ult is None or (intervalo and (agora - ult).total_seconds() >= intervalo * 60 - 5)
+    params = (capital_g, meta_g, min_neg, so_opcoes)
     if not (forcar or velha):
+        if ss.get("params") != params and ss["leituras"]:   # mudou capital/meta: só recalcula
+            res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO)
+            ss["leituras"][-1] = (ss["leituras"][-1][0], res, ops, rk)
+            ss["params"] = params
         return
+    ss["params"] = params
     with st.spinner("Atualizando dados..."):
         if not ss["hv"] and not DEMO:
             ss["hv"] = monitor.hv_lote(ATIVOS)
@@ -204,7 +220,7 @@ def painel_monitor():
                             money=["preco", "risco_valor_realista"], num=["iv_hv", "trava_ve_risco"]),
                  hide_index=True, width="stretch", height=420)
     st.caption("**nota** 0–100: liquidez + distância entre IV e vol histórica + qualidade da melhor trava "
-               "(valor esperado por R$ de risco, usando a HV). **sinal**: IV/HV > 1,2 favorece vender prêmio; "
+               "(valor esperado por R\\$ de risco, usando a HV). **sinal**: IV/HV > 1,2 favorece vender prêmio; "
                "< 0,8 favorece comprar. **lido_as**: horário do dado daquele ativo. "
                "**risco_meta**: quão realista é bater a meta hoje na melhor opção de alto risco; "
                "**risco_valor_realista**: quanto o capital viraria nela com um movimento típico do dia. "
@@ -223,7 +239,6 @@ def painel_monitor():
 
 @st.fragment(run_every=RUN)
 def painel_risco():
-    st.subheader("Alto risco — todas as oportunidades de multiplicar o capital")
     st.error("Compra de opções fora do dinheiro: o resultado mais provável é **perder 100% do valor aplicado**. "
              "Use apenas dinheiro que você pode perder sem prejudicar suas contas.")
     garantir_leitura(st.button("Atualizar agora", type="primary", key="bt_risco"))
@@ -232,8 +247,8 @@ def painel_risco():
     status_linha()
     _, _, _, rk = ss["leituras"][-1]
     mult = meta_g / capital_g
-    st.caption(f"Capital R$ {capital_g:,.2f} → meta R$ {meta_g:,.2f} = **{mult:.1f}x**. "
-               f"Ajuste na barra lateral. Probabilidades com a vol histórica 21d de cada ativo.")
+    st.caption(f"Capital R\\$ {br(capital_g)} → meta R\\$ {br(meta_g)} = **{mult:.1f}x**. "
+               f"Probabilidades com a vol histórica 21d de cada ativo.")
     if rk.empty:
         st.info("Nenhuma opção líquida cabe no capital informado (lote mínimo de 100).")
         return
@@ -245,7 +260,7 @@ def painel_risco():
     k[2].metric("Retorno esperado mediano (modelo)", f"{rk['retorno_esperado'].median():+.0%}")
     if best["prob_hoje"] > 0:
         st.info(f"Na melhor opção de todos os ativos, a chance de bater a meta hoje é ≈ 1 em "
-                f"{1 / best['prob_hoje']:,.0f}. Na grande maioria das vezes, o capital inteiro é perdido.")
+                f"{br(1 / best['prob_hoje'], 0)}. Na grande maioria das vezes, o capital inteiro é perdido.")
     st.markdown("**Alertas de alto risco**")
     tabela_alertas(ss["alertas_risco"], "Aparecem a partir da segunda leitura, só para séries com chance de pelo "
                                         "menos 0,5% hoje: chance subindo, série nova no top 10, prêmio ±25%.")
@@ -405,7 +420,7 @@ with aba[1]:
                                  money=["strike", "preco", "valor_extr"],
                                  num=["delta", "gama", "theta", "vega"]),
                       hide_index=True, width="stretch", height=520)
-    st.caption("Theta em R$ por dia útil; vega em R$ por 1 p.p. de volatilidade; "
+    st.caption("Theta em R\\$ por dia útil; vega em R\\$ por 1 p.p. de volatilidade; "
                "prob. de exercício pelo modelo Black-Scholes (neutro ao risco).")
 
 # ================================================================ 2. volatilidade
@@ -592,7 +607,7 @@ with aba[5]:
         k[3].metric("Prob. de lucro", PCT(m["prob_lucro"]))
         k[4].metric("Valor esperado", f"R$ {m['valor_esperado'] * mult:,.2f}")
         if m["breakevens"]:
-            st.caption("Ponto(s) de equilíbrio: " + ", ".join(f"R$ {b:,.2f} ({b / S - 1:+.1%})"
+            st.caption("Ponto(s) de equilíbrio: " + ", ".join(f"R\\$ {br(b)} ({b / S - 1:+.1%})"
                                                                 for b in m["breakevens"]))
         lo, hi = S * 0.7, S * 1.3
         sel = (m["grade"] >= lo) & (m["grade"] <= hi)
