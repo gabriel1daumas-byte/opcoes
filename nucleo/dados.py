@@ -24,12 +24,44 @@ def _num(x):
 
 
 # ---------------------------------------------------------------- opcoes.net.br
+import threading
+import time
+
+INTERVALO_MIN = 5.0          # segundos entre requisições (o site bloqueia rajadas com HTTP 429)
+_trava = threading.Lock()
+_ultima_req = [0.0]
+_bloqueado_ate = [0.0]
+
+
+class LimiteRequisicoes(RuntimeError):
+    """O opcoes.net.br pediu para esperar (HTTP 429)."""
+
+    def __init__(self, espera):
+        super().__init__(f"opcoes.net.br limitou as requisições; tente de novo em {espera:.0f}s")
+        self.espera = espera
+
+
+def espera_restante():
+    return max(0.0, _bloqueado_ate[0] - time.time())
+
+
 def _get_opcoes(ticker, vencimento=None, listar_venc=True):
     params = {"idAcao": ticker.upper(), "listarVencimentos": str(listar_venc).lower(),
               "cotacoes": "true"}
     if vencimento:
         params["vencimentos"] = vencimento
-    r = requests.get(URL_OPCOES, params=params, headers=HEADERS, timeout=20)
+    with _trava:
+        if espera_restante() > 0:
+            raise LimiteRequisicoes(espera_restante())
+        pausa = INTERVALO_MIN - (time.time() - _ultima_req[0])
+        if pausa > 0:
+            time.sleep(pausa)
+        r = requests.get(URL_OPCOES, params=params, headers=HEADERS, timeout=20)
+        _ultima_req[0] = time.time()
+    if r.status_code == 429:
+        espera = float(r.headers.get("Retry-After") or 60)
+        _bloqueado_ate[0] = time.time() + espera
+        raise LimiteRequisicoes(espera)
     r.raise_for_status()
     j = r.json()
     if not j.get("success", True) or "data" not in j:
@@ -37,9 +69,7 @@ def _get_opcoes(ticker, vencimento=None, listar_venc=True):
     return j["data"]
 
 
-def listar_vencimentos(ticker):
-    """Lista de dicts {data, du, mensal} dos vencimentos disponíveis."""
-    d = _get_opcoes(ticker, listar_venc=True)
+def _parse_vencs(d):
     out = []
     for v in d.get("vencimentos") or []:
         if isinstance(v, dict):
@@ -51,9 +81,27 @@ def listar_vencimentos(ticker):
     return out
 
 
+def listar_vencimentos(ticker):
+    """Lista de dicts {data, du, mensal} dos vencimentos disponíveis."""
+    return _parse_vencs(_get_opcoes(ticker, listar_venc=True))
+
+
+def vencimentos_e_grade(ticker):
+    """Uma única requisição: vencimentos + grade do vencimento padrão do site."""
+    d = _get_opcoes(ticker, listar_venc=True)
+    vencs = _parse_vencs(d)
+    if not vencs:
+        raise RuntimeError("sem vencimentos")
+    v = next((x for x in vencs if x["selecionado"]), vencs[0])
+    return vencs, v, _parse_grade(d, v["data"])
+
+
 def grade_opcoes(ticker, vencimento):
     """DataFrame com a grade de opções de um vencimento."""
-    d = _get_opcoes(ticker, vencimento, listar_venc=False)
+    return _parse_grade(_get_opcoes(ticker, vencimento, listar_venc=False), vencimento)
+
+
+def _parse_grade(d, vencimento):
     linhas = []
     for i in d.get("cotacoesOpcoes") or []:
         i = list(i) + [None] * (12 - len(i))

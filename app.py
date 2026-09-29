@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from nucleo import dados
+from nucleo import dados, monitor
 from nucleo.analise import (enriquecer, scanner_renda, scanner_travas, metricas, payoff_hoje,
                             scanner_multiplicador)
 from nucleo.bs import vol_historica, dias_uteis, DIAS_ANO
@@ -19,8 +19,8 @@ PCT = "{:.1%}".format
 
 # ================================================================ cache de dados
 @st.cache_data(ttl=600, show_spinner=False)
-def c_vencimentos(ticker):
-    return dados.listar_vencimentos(ticker)
+def c_venc_grade(ticker):
+    return dados.vencimentos_e_grade(ticker)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -53,9 +53,202 @@ selic = st.sidebar.number_input("Selic (% a.a.)", 0.0, 50.0, float(selic_auto), 
 r = float(np.log(1 + selic / 100))  # taxa contínua
 min_neg = st.sidebar.number_input("Mínimo de negócios no dia", 0, 10000, 10, 5,
                                   help="Filtra opções sem liquidez (preço pode estar velho).")
+capital_g = st.sidebar.number_input("Capital para alto risco (R$)", 10.0, 1e7, 697.0, 10.0)
+meta_g = st.sidebar.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0)
 st.sidebar.caption("Ferramenta de estudo. Não é recomendação de investimento. "
                    "Custos de corretagem, emolumentos e IR não estão incluídos.")
 
+
+
+def fmt_tabela(df, pct=(), money=(), num=()):
+    f = {c: "{:.1%}" for c in pct if c in df}
+    f.update({c: "R$ {:,.2f}" for c in money if c in df})
+    f.update({c: "{:.3f}" for c in num if c in df})
+    return df.style.format(f, na_rep="—")
+
+
+# ================================================================ abas principais
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("America/Sao_Paulo")
+DEMO = fonte == "Demonstração"
+
+
+def pregao_aberto(agora):
+    return agora.weekday() < 5 and (10, 0) <= (agora.hour, agora.minute) < (17, 0)
+
+
+if DEMO:
+    st.warning("Modo demonstração: dados sintéticos, apenas para conhecer o app.")
+top = st.tabs(["Monitor do dia", "Alto risco", "Outros menus"])
+OUT = top[2]
+
+ss = st.session_state
+if ss.get("fonte_ant") != fonte:            # trocou a fonte: zera o monitor
+    for k_ in ("cache", "leituras", "alertas", "alertas_risco", "hv"):
+        ss.pop(k_, None)
+    ss["fonte_ant"] = fonte
+ss.setdefault("cache", {})         # ativo -> (hora, S, venc, grade)
+ss.setdefault("leituras", [])      # (hora, resumo, ops, risco)
+ss.setdefault("alertas", [])       # (hora, ativo, texto) — monitor
+ss.setdefault("alertas_risco", []) # (hora, ativo, texto) — alto risco
+ss.setdefault("hv", {})
+
+with top[0]:
+    st.subheader("Monitor do dia — oportunidades em vários ativos")
+    m1, m2, m3 = st.columns([4, 1, 1])
+    ativos_txt = m1.text_area("Ativos (separados por vírgula)", ", ".join(monitor.ATIVOS_PADRAO), height=68)
+    intervalo = m2.selectbox("Atualizar a cada", [0, 5, 10, 15, 30], index=2,
+                             format_func=lambda x: "manual" if x == 0 else f"{x} min")
+    por_rodada = m3.number_input("Ativos por rodada", 1, 30, 5,
+                                 help="O site gratuito bloqueia muitas consultas seguidas (HTTP 429). "
+                                      "O app atualiza alguns ativos por rodada, em rodízio.")
+ATIVOS = [a.strip().upper() for a in ativos_txt.replace(";", ",").split(",") if a.strip()]
+
+
+def garantir_leitura(forcar=False):
+    """Faz uma nova rodada se a última estiver velha (compartilhada pelas duas abas)."""
+    agora = datetime.now(TZ)
+    ult = ss["leituras"][-1][0] if ss["leituras"] else None
+    velha = ult is None or (intervalo and (agora - ult).total_seconds() >= intervalo * 60 - 5)
+    if not (forcar or velha):
+        return
+    with st.spinner("Atualizando dados..."):
+        if not ss["hv"] and not DEMO:
+            ss["hv"] = monitor.hv_lote(ATIVOS)
+        ss["mon_erros"] = monitor.atualizar_cache(ATIVOS, ss["cache"], por_rodada, DEMO, r)
+        res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO)
+    hora = agora.strftime("%H:%M")
+    if ss["leituras"]:
+        _, res0, ops0, rk0 = ss["leituras"][-1]
+        for a_, txt in monitor.comparar(res, res0, ops, ops0):
+            ss["alertas"].insert(0, (hora, a_, txt))
+        for a_, txt in monitor.comparar_risco(rk, rk0):
+            ss["alertas_risco"].insert(0, (hora, a_, txt))
+    ss["leituras"].append((agora, res, ops, rk))
+    del ss["leituras"][:-60]
+    try:
+        if not res.empty:
+            import os
+            res.assign(hora=agora.strftime("%Y-%m-%d %H:%M")).to_csv(
+                "historico_monitor.csv", mode="a", index=False, header=not os.path.exists("historico_monitor.csv"))
+    except Exception:
+        pass
+
+
+def status_linha():
+    agora = datetime.now(TZ)
+    ts = ss["leituras"][-1][0]
+    n = len(ss["cache"])
+    st.caption(f"Última rodada: {ts:%H:%M:%S} · {n}/{len(ATIVOS)} ativos já lidos · "
+               f"{'pregão ABERTO' if pregao_aberto(agora) else 'pregão FECHADO (último negócio)'} · "
+               f"{'automático a cada ' + str(intervalo) + ' min' if intervalo else 'manual'}")
+    errs = ss.get("mon_erros") or {}
+    if "_limite" in errs:
+        st.warning(errs["_limite"])
+    outros = {k: v for k, v in errs.items() if k != "_limite"}
+    if outros:
+        with st.expander(f"{len(outros)} ativo(s) com erro"):
+            st.write(outros)
+
+
+def tabela_alertas(lista, vazio):
+    if lista:
+        st.dataframe(pd.DataFrame(lista[:50], columns=["hora", "ativo", "o que mudou"]), hide_index=True,
+                     width="stretch", height=min(36 * len(lista[:50]) + 38, 300))
+    else:
+        st.caption(vazio)
+
+
+RUN = f"{intervalo}m" if intervalo else None
+
+
+@st.fragment(run_every=RUN)
+def painel_monitor():
+    garantir_leitura(st.button("Atualizar agora", type="primary", key="bt_mon"))
+    if not ss["leituras"]:
+        return
+    status_linha()
+    _, res, _, _ = ss["leituras"][-1]
+    if res.empty:
+        st.info("Ainda sem dados suficientes. Aguarde a próxima rodada.")
+        return
+    k = st.columns(3)
+    for i, (_, x) in enumerate(res.head(3).iterrows()):
+        k[i].metric(f"#{i + 1} {x['ativo']}", f"nota {x['nota']:.0f}",
+                    f"{x['sinal']} · IV/HV {x['iv_hv']:.2f}" if np.isfinite(x["iv_hv"]) else x["sinal"],
+                    delta_color="off")
+    st.markdown("**Alertas do dia**")
+    tabela_alertas(ss["alertas"], "Os alertas aparecem a partir da segunda leitura de cada ativo (preço ±1%, "
+                                  "IV ±2 p.p., mudança de sinal de vol, salto de negócios, nota subindo).")
+    st.markdown("**Ranking de oportunidades**")
+    cols = ["ativo", "nota", "lido_as", "preco", "du", "negocios", "iv_atm", "hv21", "iv_hv", "sinal",
+            "renda_melhor", "renda_taxa_aa", "trava_melhor", "trava_ve_risco", "trava_prob"]
+    st.dataframe(fmt_tabela(res[cols], pct=["iv_atm", "hv21", "renda_taxa_aa", "trava_prob"],
+                            money=["preco"], num=["iv_hv", "trava_ve_risco"]),
+                 hide_index=True, width="stretch", height=420)
+    st.caption("**nota** 0–100: liquidez + distância entre IV e vol histórica + qualidade da melhor trava "
+               "(valor esperado por R$ de risco, usando a HV). **sinal**: IV/HV > 1,2 favorece vender prêmio; "
+               "< 0,8 favorece comprar. **lido_as**: horário do dado daquele ativo. "
+               "Para detalhar um ativo, use a barra lateral e a aba Outros menus.")
+    hist_iv = [l[1].assign(hora=l[0]) for l in ss["leituras"] if not l[1].empty]
+    if len(hist_iv) >= 2:
+        st.markdown("**IV ATM ao longo do dia (top 5)**")
+        h = pd.concat(hist_iv)
+        fig = go.Figure()
+        for a_ in res.head(5)["ativo"]:
+            x = h[h["ativo"] == a_]
+            fig.add_scatter(x=x["hora"], y=x["iv_atm"], name=a_, mode="lines+markers")
+        fig.update_layout(yaxis_tickformat=".0%", height=320, margin=dict(t=10, b=30), legend=dict(orientation="h"))
+        st.plotly_chart(fig, width="stretch")
+
+
+@st.fragment(run_every=RUN)
+def painel_risco():
+    st.subheader("Alto risco — todas as oportunidades de multiplicar o capital")
+    st.error("Compra de opções fora do dinheiro: o resultado mais provável é **perder 100% do valor aplicado**. "
+             "Use apenas dinheiro que você pode perder sem prejudicar suas contas.")
+    garantir_leitura(st.button("Atualizar agora", type="primary", key="bt_risco"))
+    if not ss["leituras"]:
+        return
+    status_linha()
+    _, _, _, rk = ss["leituras"][-1]
+    mult = meta_g / capital_g
+    st.caption(f"Capital R$ {capital_g:,.2f} → meta R$ {meta_g:,.2f} = **{mult:.1f}x**. "
+               f"Ajuste na barra lateral. Probabilidades com a vol histórica 21d de cada ativo.")
+    if rk.empty:
+        st.info("Nenhuma opção líquida cabe no capital informado (lote mínimo de 100).")
+        return
+    best = rk.iloc[0]
+    k = st.columns(3)
+    k[0].metric("Melhor chance de bater a meta HOJE", f"{best['prob_hoje']:.2%}", f"{best['codigo']} ({best['ativo']})",
+                delta_color="off")
+    k[1].metric("Melhor chance até o vencimento", f"{rk['prob_venc'].max():.2%}")
+    k[2].metric("Retorno esperado mediano (modelo)", f"{rk['retorno_esperado'].median():+.0%}")
+    if best["prob_hoje"] > 0:
+        st.info(f"Na melhor opção de todos os ativos, a chance de bater a meta hoje é ≈ 1 em "
+                f"{1 / best['prob_hoje']:,.0f}. Na grande maioria das vezes, o capital inteiro é perdido.")
+    st.markdown("**Alertas de alto risco**")
+    tabela_alertas(ss["alertas_risco"], "Aparecem a partir da segunda leitura: chance subindo, série nova no "
+                                        "top 10, prêmio variando ±25%.")
+    st.markdown("**Ranking (todas as séries, todos os ativos)**")
+    cols = ["ativo", "codigo", "tipo", "strike", "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje",
+            "mov_venc", "prob_venc", "prob_lucro_venc", "retorno_esperado", "iv", "preco_ativo", "du"]
+    st.dataframe(fmt_tabela(rk[cols], pct=["mov_hoje", "prob_hoje", "mov_venc", "prob_venc", "prob_lucro_venc",
+                                            "retorno_esperado", "iv"],
+                            money=["strike", "preco", "custo", "preco_ativo"]),
+                 hide_index=True, width="stretch", height=460)
+    st.caption("**mov_hoje**: quanto a ação precisa andar até o fechamento de hoje para a opção valer a meta. "
+               "**prob_hoje / prob_venc**: chance estimada (log-normal). **retorno_esperado**: valor teórico ÷ "
+               "preço − 1 (negativo = opção cara). Preço = último negócio; confira o book. Sem custos e IR.")
+
+
+with top[0]:
+    painel_monitor()
+with top[1]:
+    painel_risco()
+
+# ================================================================ Outros menus (1 ativo)
 hist, grade, vencs, erros = None, None, [], []
 
 if fonte == "Demonstração":
@@ -63,7 +256,7 @@ if fonte == "Demonstração":
     vencs = dados.vencimentos_demo()
 elif fonte == "Online (gratuito)":
     try:
-        vencs = c_vencimentos(ticker)
+        vencs, v_padrao, grade_padrao = c_venc_grade(ticker)
     except Exception as e:
         erros.append(f"Não consegui listar vencimentos em opcoes.net.br: {e}")
     try:
@@ -91,8 +284,8 @@ for e in erros:
     st.sidebar.warning(e)
 
 if not vencs:
-    st.title("Analisador de Opções B3")
-    st.info("Sem vencimentos disponíveis. Verifique o ativo/conexão, envie um CSV ou use o modo Demonstração.")
+    OUT.title("Analisador de Opções B3")
+    OUT.info("Sem vencimentos disponíveis. Verifique o ativo/conexão, envie um CSV ou use o modo Demonstração.")
     st.stop()
 
 
@@ -113,12 +306,15 @@ try:
         S_demo = float(hist["Close"].iloc[-1])
         grade = dados.grade_demo(S_demo, venc["data"], r=r)
     elif fonte == "Online (gratuito)":
-        with st.spinner("Baixando grade de opções..."):
-            grade = c_grade(ticker, venc["data"])
+        if venc["data"] == v_padrao["data"]:
+            grade = grade_padrao
+        else:
+            with OUT, st.spinner("Baixando grade de opções..."):
+                grade = c_grade(ticker, venc["data"])
     else:
         grade = csv[csv["vencimento"] == venc["data"]].copy()
 except Exception as e:
-    st.error(f"Falha ao obter a grade de opções: {e}")
+    OUT.error(f"Falha ao obter a grade de opções: {e}")
     st.stop()
 
 # preço à vista: histórico > grade > manual
@@ -132,7 +328,7 @@ if fonte == "Online (gratuito)":
 if fonte == "Arquivo CSV" and s_manual > 0:
     S = s_manual
 if not np.isfinite(S) or S <= 0:
-    st.error("Não foi possível determinar o preço do ativo. Informe-o manualmente (modo CSV).")
+    OUT.error("Não foi possível determinar o preço do ativo. Informe-o manualmente (modo CSV).")
     st.stop()
 
 # volatilidades históricas
@@ -152,11 +348,9 @@ atm = liq.assign(d=(liq["strike"] - S).abs()).sort_values("d").head(4)
 iv_atm = float(atm["iv"].median()) if not atm.empty else (hv21 or 0.3)
 
 # ================================================================ cabeçalho
-st.title(f"{ticker} — opções vencimento {datetime.strptime(venc['data'], '%Y-%m-%d'):%d/%m/%Y}")
-if fonte == "Demonstração":
-    st.warning("Modo demonstração: dados sintéticos, apenas para conhecer o app.")
+OUT.title(f"{ticker} — opções vencimento {datetime.strptime(venc['data'], '%Y-%m-%d'):%d/%m/%Y}")
 
-c = st.columns(6)
+c = OUT.columns(6)
 c[0].metric("Preço do ativo", f"R$ {S:,.2f}")
 c[1].metric("Dias úteis", du)
 c[2].metric("Vol. implícita ATM", PCT(iv_atm))
@@ -168,19 +362,12 @@ if hv21:
                 "prêmios caros" if razao > 1.15 else ("prêmios baratos" if razao < 0.85 else "neutro"),
                 delta_color="off")
 
-aba = st.tabs(["Grade de opções", "Volatilidade", "Scanner de renda", "Scanner de travas",
-               "Montador de estratégias", "Alto risco", "Como usar"])
 
-
-def fmt_tabela(df, pct=(), money=(), num=()):
-    f = {c: "{:.1%}" for c in pct if c in df}
-    f.update({c: "R$ {:,.2f}" for c in money if c in df})
-    f.update({c: "{:.3f}" for c in num if c in df})
-    return df.style.format(f, na_rep="—")
-
+aba = [None] + list(OUT.tabs(["Grade de opções", "Volatilidade", "Scanner de renda", "Scanner de travas",
+                         "Montador de estratégias", "Alto risco (1 ativo)", "Como usar"]))
 
 # ================================================================ 1. grade
-with aba[0]:
+with aba[1]:
     so_liq = st.checkbox("Mostrar só opções com liquidez", True)
     base = g[g["negocios"] >= min_neg] if so_liq else g
     cols = ["codigo", "strike", "preco", "negocios", "iv", "delta", "gama", "theta", "vega",
@@ -197,7 +384,7 @@ with aba[0]:
                "prob. de exercício pelo modelo Black-Scholes (neutro ao risco).")
 
 # ================================================================ 2. volatilidade
-with aba[1]:
+with aba[2]:
     l, rr = st.columns(2)
     with l:
         st.subheader("Sorriso de volatilidade")
@@ -247,7 +434,7 @@ with aba[1]:
                                num=["iv_hv", "delta"]), hide_index=True, width="stretch")
 
 # ================================================================ 3. scanner de renda
-with aba[2]:
+with aba[3]:
     st.subheader("Venda coberta e venda de put")
     f1, f2, f3 = st.columns(3)
     faixa_delta = f1.slider("|Delta| (≈ chance de exercício)", 0.0, 1.0, (0.15, 0.45), 0.05)
@@ -271,7 +458,7 @@ with aba[2]:
                f"de a opção virar pó e você ficar com o prêmio.")
 
 # ================================================================ 4. scanner de travas
-with aba[3]:
+with aba[4]:
     st.subheader("Travas verticais")
     f1, f2, f3, f4 = st.columns(4)
     base_vol = f1.selectbox("Volatilidade para probabilidades",
@@ -337,7 +524,7 @@ def montar_modelo(nome):
     return pd.DataFrame(pernas)
 
 
-with aba[4]:
+with aba[5]:
     st.subheader("Montador de estratégias")
     a, b, c3 = st.columns([2, 1, 1])
     modelo = a.selectbox("Modelo inicial", list(MODELOS))
@@ -415,13 +602,14 @@ with aba[4]:
 
 
 # ================================================================ 6. alto risco
-with aba[5]:
-    st.subheader("Alto risco — multiplicar o capital")
+with aba[6]:
+    st.subheader("Alto risco — ativo da barra lateral")
     st.error("Compra de opções fora do dinheiro: o resultado mais provável é **perder 100% do valor aplicado**. "
              "Use apenas dinheiro que você pode perder sem prejudicar suas contas.")
     f1, f2, f3, f4 = st.columns(4)
-    capital = f1.number_input("Capital (R$)", 10.0, 1e7, 697.0, 10.0)
-    meta = f2.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0)
+    capital, meta = capital_g, meta_g
+    f1.metric("Capital", f"R$ {capital:,.2f}")
+    f2.metric("Meta", f"R$ {meta:,.2f}")
     mult = meta / capital
     base_v = f3.selectbox("Vol. para probabilidades", ["HV 21d (histórica)", "IV ATM (mercado)"], key="vol_ar")
     sig_ar = (hv21 or iv_atm) if base_v.startswith("HV") else iv_atm
@@ -457,7 +645,7 @@ with aba[5]:
                        "Lote mínimo de 100 opções. Não considera spread do book, corretagem nem IR.")
 
 # ================================================================ 7. ajuda
-with aba[6]:
+with aba[7]:
     st.markdown("""
 ### Fluxo sugerido
 1. **Volatilidade** — veja se a IV está cara ou barata vs. a histórica. Isso define o lado:
