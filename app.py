@@ -77,7 +77,10 @@ def fmt_tabela(df, pct=(), money=(), num=()):
     sty = df.style.format(f, na_rep="—")
     cores = {"Realista": "#2e9e5b", "Possível": "#7cb342", "Ousado": "#e8833a",
              "Muito ousado": "#d64545", "Praticamente impossível": "#8a8f98"}
-    metas = [c for c in df.columns if c in ("meta_hoje", "meta_venc", "risco_meta")]
+    cores.update({"ALTA": "#2e9e5b", "BAIXA": "#d64545", "LATERAL": "#8a8f98", "CALL": "#2e9e5b",
+                  "PUT": "#d64545", "sim": "#2e9e5b", "contra": "#d64545"})
+    metas = [c for c in df.columns if c in ("meta_hoje", "meta_venc", "risco_meta", "direcao", "lado",
+                                             "tendencia", "a_favor")]
     if metas:
         sty = sty.map(lambda v: f"color: {cores.get(v, 'inherit')}; font-weight: 600", subset=metas)
     return sty
@@ -101,7 +104,7 @@ OUT = top[2]
 
 ss = st.session_state
 if ss.get("fonte_ant") != fonte:            # trocou a fonte: zera o monitor
-    for k_ in ("cache", "leituras", "alertas", "alertas_risco", "hv"):
+    for k_ in ("cache", "leituras", "alertas", "alertas_risco", "hv", "tend"):
         ss.pop(k_, None)
     ss["fonte_ant"] = fonte
 ss.setdefault("cache", {})         # ativo -> (hora, S, venc, grade)
@@ -109,6 +112,7 @@ ss.setdefault("leituras", [])      # (hora, resumo, ops, risco)
 ss.setdefault("alertas", [])       # (hora, ativo, texto) — monitor
 ss.setdefault("alertas_risco", []) # (hora, ativo, texto) — alto risco
 ss.setdefault("hv", {})
+ss.setdefault("tend", {})
 
 with top[0]:
     st.subheader("Monitor do dia — oportunidades em vários ativos")
@@ -137,7 +141,7 @@ def garantir_leitura(forcar=False):
     params = (capital_g, meta_g, min_neg, so_opcoes)
     if not (forcar or velha):
         if ss.get("params") != params and ss["leituras"]:   # mudou capital/meta: só recalcula
-            res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO)
+            res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO, ss["tend"])
             ss["leituras"][-1] = (ss["leituras"][-1][0], res, ops, rk)
             ss["params"] = params
         return
@@ -145,8 +149,10 @@ def garantir_leitura(forcar=False):
     with st.spinner("Atualizando dados..."):
         if not ss["hv"] and not DEMO:
             ss["hv"] = monitor.hv_lote(ATIVOS)
+        if not ss["tend"]:
+            ss["tend"] = monitor.tendencia_lote(ATIVOS, DEMO)
         ss["mon_erros"] = monitor.atualizar_cache(ATIVOS, ss["cache"], por_rodada, DEMO, r)
-        res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO)
+        res, ops, rk = monitor.analisar(ss["cache"], ATIVOS, r, ss["hv"], min_neg, capital_g, meta_g, DEMO, ss["tend"])
     hora = agora.strftime("%H:%M")
     if ss["leituras"]:
         _, res0, ops0, rk0 = ss["leituras"][-1]
@@ -204,22 +210,30 @@ def painel_monitor():
         return
     k = st.columns(3)
     for i, (_, x) in enumerate(res.head(3).iterrows()):
-        k[i].metric(f"#{i + 1} {x['ativo']}", f"nota {x['nota']:.0f}",
-                    f"{x['sinal']} · IV/HV {x['iv_hv']:.2f}" if np.isfinite(x["iv_hv"]) else x["sinal"],
-                    delta_color="off")
+        seta = {"ALTA": "▲ ALTA → CALL", "BAIXA": "▼ BAIXA → PUT"}.get(x["direcao"], "◆ LATERAL")
+        k[i].metric(f"#{i + 1} {x['ativo']}", seta, f"nota {x['nota']:.0f} · {x['sinal']}", delta_color="off")
+        k[i].caption(f"Estrutura: **{x['estrutura']}**" + (f" — {x['trava_sugerida']}" if x["trava_sugerida"] else ""))
     st.markdown("**Alertas do dia**")
     tabela_alertas(ss["alertas"], "Os alertas aparecem a partir da segunda leitura de cada ativo (preço ±1%, "
                                   "IV ±2 p.p., mudança de sinal de vol, salto de negócios, nota subindo).")
     st.markdown("**Ranking de oportunidades**")
-    cols = ["ativo", "vencimento", "nota", "lido_as", "preco", "du", "negocios", "iv_atm", "hv21", "iv_hv", "sinal",
+    cols = ["ativo", "vencimento", "nota", "direcao", "lado", "estrutura", "trava_sugerida", "sug_prob",
+            "sug_ganho_max", "sug_perda_max", "motivo", "lido_as", "preco", "du", "negocios", "iv_atm", "hv21",
+            "iv_hv", "sinal",
             "renda_melhor", "renda_taxa_aa", "trava_melhor", "trava_ve_risco", "trava_prob",
             "risco_melhor", "risco_meta", "risco_prob_hoje", "risco_valor_realista"]
     if so_opcoes:
         cols = [c_ for c_ in cols if not c_.startswith("renda_")]
-    st.dataframe(fmt_tabela(res[cols], pct=["iv_atm", "hv21", "renda_taxa_aa", "trava_prob", "risco_prob_hoje"],
-                            money=["preco", "risco_valor_realista"], num=["iv_hv", "trava_ve_risco"]),
+    st.dataframe(fmt_tabela(res[cols], pct=["iv_atm", "hv21", "renda_taxa_aa", "trava_prob", "risco_prob_hoje",
+                                            "sug_prob"],
+                            money=["preco", "risco_valor_realista", "sug_ganho_max", "sug_perda_max"],
+                            num=["iv_hv", "trava_ve_risco"]),
                  hide_index=True, width="stretch", height=420)
-    st.caption("**nota** 0–100: liquidez + distância entre IV e vol histórica + qualidade da melhor trava "
+    st.caption("**direcao**: tendência pela média de 20 e 50 dias, retorno de 5 dias e fluxo de negócios em calls "
+               "x puts (ALTA → lado CALL, BAIXA → lado PUT). **estrutura**: o tipo de operação só com opções que "
+               "combina com a direção + o sinal de vol; **trava_sugerida** é a melhor desse tipo, com chance de "
+               "lucro e ganho/perda máximos por unidade (×100 por lote). "
+               "**nota** 0–100: liquidez + distância entre IV e vol histórica + qualidade da melhor trava "
                "(valor esperado por R\\$ de risco, usando a HV). **sinal**: IV/HV > 1,2 favorece vender prêmio; "
                "< 0,8 favorece comprar. **lido_as**: horário do dado daquele ativo. "
                "**risco_meta**: quão realista é bater a meta hoje na melhor opção de alto risco; "
@@ -268,7 +282,8 @@ def painel_risco():
         st.warning("Nenhuma opção tem chance relevante (≥ 0,5%) de bater a meta hoje. Com a meta atual, o movimento "
                    "necessário é grande demais para um pregão.")
     st.markdown("**Ranking (todas as séries, todos os ativos)**")
-    cols = ["ativo", "codigo", "vencimento", "meta_hoje", "valor_realista", "mult_realista", "tipo", "strike",
+    cols = ["ativo", "codigo", "vencimento", "tipo", "tendencia", "a_favor", "meta_hoje", "valor_realista",
+            "mult_realista", "strike",
             "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje", "meta_venc",
             "mov_venc", "prob_venc", "prob_lucro_venc", "retorno_esperado", "iv", "preco_ativo", "du"]
     st.dataframe(fmt_tabela(rk[cols], pct=["mov_hoje", "prob_hoje", "mov_venc", "prob_venc", "prob_lucro_venc",

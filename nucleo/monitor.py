@@ -73,7 +73,7 @@ def atualizar_cache(tickers, cache, max_req=5, demo=False, r=0.14):
     return erros
 
 
-def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo=False):
+def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo=False, tend=None):
     """Resumo por ativo + candidatos de alto risco de todos os ativos em cache."""
     resumo, ops, riscos = [], [], []
     mult = meta / capital
@@ -106,10 +106,16 @@ def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo
         if not tr.empty:
             tr = tr[tr["alerta"] == ""]
         top_tr = tr.sort_values("ve_por_risco", ascending=False).head(1) if not tr.empty else tr
+        cn = float(liq.loc[liq["tipo"] == "CALL", "negocios"].sum())
+        pn = float(liq.loc[liq["tipo"] == "PUT", "negocios"].sum())
+        dirc, pts, motivo = direcao(S, (tend or {}).get(t), cn, pn)
         ar = scanner_multiplicador(e, S, du, r, sig, capital, mult, min_neg)
         ar = ar[ar["qtd"] > 0] if not ar.empty else ar
         if not ar.empty:
-            ar = ar.sort_values("prob_hoje", ascending=False)
+            ar = ar.sort_values(["prob_hoje", "prob_venc"], ascending=False)
+            ar["tendencia"] = dirc
+            ar["a_favor"] = np.where(dirc == "LATERAL", "—",
+                                     np.where((ar["tipo"] == "CALL") == (dirc == "ALTA"), "sim", "contra"))
             riscos.append(ar.head(5).assign(ativo=t, preco_ativo=S, vencimento=v["data"], du=du,
                                             vol_usada=sig, lido_as=ts))
         top_ar = ar.head(1)
@@ -117,9 +123,19 @@ def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo
         razao = iv_atm / h if np.isfinite(h) else np.nan
         sinal = ("VENDER vol (prêmios caros)" if razao > 1.2 else
                  "COMPRAR vol (prêmios baratos)" if razao < 0.8 else "neutro") if np.isfinite(razao) else "—"
+        vol_k = "caro" if razao > 1.2 else "barato" if razao < 0.8 else "neutro"
+        estrutura = ESTRUTURA[(dirc, vol_k)]
+        lado = "CALL" if dirc == "ALTA" else "PUT" if dirc == "BAIXA" else "—"
+        sug = tr[tr["estrategia"] == estrutura].sort_values("ve_por_risco", ascending=False).head(1) \
+            if not tr.empty else tr
         linha = dict(ativo=t, lido_as=ts.strftime("%H:%M"), idade_min=int((agora - ts).total_seconds() // 60),
                      preco=S, vencimento=v["data"], du=du, negocios=int(liq["negocios"].sum()),
                      iv_atm=iv_atm, hv21=h, iv_hv=razao, sinal=sinal,
+                     direcao=dirc, forca=pts, lado=lado, motivo=motivo, estrutura=estrutura,
+                     trava_sugerida=(f"{sug.iloc[0]['perna1']} / {sug.iloc[0]['perna2']}" if len(sug) else ""),
+                     sug_prob=float(sug.iloc[0]["prob_lucro"]) if len(sug) else np.nan,
+                     sug_ganho_max=float(sug.iloc[0]["ganho_max"]) if len(sug) else np.nan,
+                     sug_perda_max=float(sug.iloc[0]["perda_max"]) if len(sug) else np.nan,
                      renda_melhor=f"{top_ren.iloc[0]['estrategia']} {top_ren.iloc[0]['codigo']}" if len(top_ren) else "",
                      renda_taxa_aa=float(top_ren.iloc[0]["taxa_aa"]) if len(top_ren) else np.nan,
                      trava_melhor=f"{top_tr.iloc[0]['estrategia']} {top_tr.iloc[0]['perna1']} / {top_tr.iloc[0]['perna2']}" if len(top_tr) else "",
@@ -143,12 +159,76 @@ def analisar(cache, tickers, r, hv, min_neg=10, capital=697.0, meta=5000.0, demo
         res = res.sort_values("nota", ascending=False).reset_index(drop=True)
     rk = pd.concat(riscos, ignore_index=True) if riscos else pd.DataFrame()
     if not rk.empty:
-        rk = rk.sort_values("prob_hoje", ascending=False).reset_index(drop=True)
+        rk = rk.sort_values(["prob_hoje", "prob_venc"], ascending=False).reset_index(drop=True)
     return res, pd.DataFrame(ops), rk
 
 
 def hv_lote(tickers):
     return _hv_lote(tickers)
+
+
+def tendencia_lote(tickers, demo=False):
+    """Médias móveis e retorno de 5 dias de cada ativo (Yahoo, diário)."""
+    out = {}
+    if demo:
+        for i, t in enumerate(tickers):
+            h = dados.historico_demo(seed=100 + i)["Close"]
+            out[t] = dict(mm20=float(h.tail(20).mean()), mm50=float(h.tail(50).mean()),
+                          fech5=float(h.iloc[-6]), escala=float(h.iloc[-1]))
+        return out
+    try:
+        import yfinance as yf
+        h = yf.download([t + ".SA" for t in tickers], period="6mo", auto_adjust=True,
+                        progress=False, group_by="ticker", threads=True)
+        for t in tickers:
+            try:
+                c = h[t + ".SA"]["Close"].dropna()
+                if len(c) >= 50:
+                    out[t] = dict(mm20=float(c.tail(20).mean()), mm50=float(c.tail(50).mean()),
+                                  fech5=float(c.iloc[-6]), escala=float(c.iloc[-1]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+ESTRUTURA = {  # (direção, sinal de vol) -> estrutura só com opções que combina com o cenário
+    ("ALTA", "caro"): "Trava de alta (put, crédito)",
+    ("ALTA", "barato"): "Trava de alta (call, débito)",
+    ("ALTA", "neutro"): "Trava de alta (call, débito)",
+    ("BAIXA", "caro"): "Trava de baixa (call, crédito)",
+    ("BAIXA", "barato"): "Trava de baixa (put, débito)",
+    ("BAIXA", "neutro"): "Trava de baixa (put, débito)",
+    ("LATERAL", "caro"): "Iron condor (vender os dois lados)",
+    ("LATERAL", "barato"): "Straddle comprado ou aguardar",
+    ("LATERAL", "neutro"): "Aguardar definição",
+}
+
+
+def direcao(S, tend, calls_neg, puts_neg):
+    """Pontua de -4 a +4: preço vs MM20, MM20 vs MM50, retorno 5d, fluxo call x put."""
+    pts, motivos = 0, []
+    if tend:
+        k = S / tend["escala"] if tend.get("escala") else 1.0   # demo: ajusta escala
+        mm20, mm50, f5 = tend["mm20"] * k, tend["mm50"] * k, tend["fech5"] * k
+        pts += 1 if S > mm20 else -1
+        motivos.append("acima da MM20" if S > mm20 else "abaixo da MM20")
+        pts += 1 if mm20 > mm50 else -1
+        motivos.append("MM20 > MM50" if mm20 > mm50 else "MM20 < MM50")
+        r5 = S / f5 - 1
+        if abs(r5) > 0.01:
+            pts += 1 if r5 > 0 else -1
+            motivos.append(f"5 dias {r5:+.1%}")
+    tot = calls_neg + puts_neg
+    if tot > 0:
+        razao = calls_neg / max(puts_neg, 1)
+        if razao > 1.5:
+            pts += 1; motivos.append("fluxo em calls")
+        elif razao < 0.67:
+            pts -= 1; motivos.append("fluxo em puts")
+    d = "ALTA" if pts >= 2 else "BAIXA" if pts <= -2 else "LATERAL"
+    return d, pts, ", ".join(motivos)
 
 
 def comparar(atual, anterior, ops_atual, ops_anterior):
@@ -167,6 +247,8 @@ def comparar(atual, anterior, ops_atual, ops_anterior):
         if abs(div) >= 0.02:
             alertas.append((t, f"IV ATM {'subiu' if div > 0 else 'caiu'} {div * 100:+.1f} p.p. "
                                f"({y['iv_atm']:.0%} → {x['iv_atm']:.0%})"))
+        if "direcao" in x and "direcao" in y and x["direcao"] != y["direcao"]:
+            alertas.append((t, f"direção mudou: {y['direcao']} → {x['direcao']} ({x['motivo']})"))
         if x["sinal"] != y["sinal"]:
             alertas.append((t, f"sinal de vol mudou: {y['sinal']} → {x['sinal']}"))
         if x["nota"] - y["nota"] >= 15:
