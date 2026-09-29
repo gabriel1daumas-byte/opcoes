@@ -7,7 +7,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from nucleo import dados
-from nucleo.analise import enriquecer, scanner_renda, scanner_travas, metricas, payoff_hoje
+from nucleo.analise import (enriquecer, scanner_renda, scanner_travas, metricas, payoff_hoje,
+                            scanner_multiplicador)
 from nucleo.bs import vol_historica, dias_uteis, DIAS_ANO
 
 st.set_page_config(page_title="Analisador de Opções B3", layout="wide")
@@ -168,7 +169,7 @@ if hv21:
                 delta_color="off")
 
 aba = st.tabs(["Grade de opções", "Volatilidade", "Scanner de renda", "Scanner de travas",
-               "Montador de estratégias", "Como usar"])
+               "Montador de estratégias", "Alto risco", "Como usar"])
 
 
 def fmt_tabela(df, pct=(), money=(), num=()):
@@ -412,8 +413,51 @@ with aba[4]:
         k[2].metric("Theta (R$/dia)", f"R$ {tot['theta'] * mult:,.2f}")
         k[3].metric("Vega (R$/1 p.p.)", f"R$ {tot['vega'] * mult:,.2f}")
 
-# ================================================================ 6. ajuda
+
+# ================================================================ 6. alto risco
 with aba[5]:
+    st.subheader("Alto risco — multiplicar o capital")
+    st.error("Compra de opções fora do dinheiro: o resultado mais provável é **perder 100% do valor aplicado**. "
+             "Use apenas dinheiro que você pode perder sem prejudicar suas contas.")
+    f1, f2, f3, f4 = st.columns(4)
+    capital = f1.number_input("Capital (R$)", 10.0, 1e7, 697.0, 10.0)
+    meta = f2.number_input("Meta (R$)", 10.0, 1e8, 5000.0, 100.0)
+    mult = meta / capital
+    base_v = f3.selectbox("Vol. para probabilidades", ["HV 21d (histórica)", "IV ATM (mercado)"], key="vol_ar")
+    sig_ar = (hv21 or iv_atm) if base_v.startswith("HV") else iv_atm
+    tipo_ar = f4.multiselect("Tipo", ["CALL", "PUT"], ["CALL", "PUT"], key="tipo_ar")
+    st.caption(f"Multiplicador necessário: **{mult:.1f}x** · vol usada: {PCT(sig_ar)} · "
+               f"movimento típico de 1 dia: ±{sig_ar / np.sqrt(DIAS_ANO):.1%}")
+    ar = scanner_multiplicador(g, S, du, r, sig_ar, capital, mult, min_neg)
+    if ar.empty:
+        st.info("Sem opções líquidas para analisar neste vencimento.")
+    else:
+        ar = ar[ar["tipo"].isin(tipo_ar) & (ar["qtd"] > 0)].sort_values("prob_hoje", ascending=False)
+        if ar.empty:
+            st.warning("Com esse capital não dá para comprar nem um lote (100 opções) de nenhuma série líquida.")
+        else:
+            best_h, best_v = ar["prob_hoje"].max(), ar["prob_venc"].max()
+            k = st.columns(3)
+            k[0].metric(f"Melhor chance de {mult:.1f}x HOJE", f"{best_h:.2%}")
+            k[1].metric(f"Melhor chance de {mult:.1f}x até o vencimento", f"{best_v:.2%}")
+            k[2].metric("Retorno esperado médio (pelo modelo)", f"{ar['retorno_esperado'].median():+.0%}")
+            um_em = f"≈ 1 em {1 / best_h:,.0f}" if best_h > 0 else "praticamente nula"
+            st.info(f"Na melhor opção, a chance de bater a meta hoje é {um_em}. "
+                    f"Ou seja: se você fizesse essa aposta muitas vezes, na grande maioria perderia o capital inteiro.")
+            cols = ["codigo", "tipo", "strike", "preco", "negocios", "qtd", "custo", "mov_hoje", "prob_hoje",
+                    "mov_venc", "prob_venc", "prob_lucro_venc", "retorno_esperado", "iv"]
+            st.dataframe(fmt_tabela(ar[cols], pct=["mov_hoje", "prob_hoje", "mov_venc", "prob_venc",
+                                                   "prob_lucro_venc", "retorno_esperado", "iv"],
+                                    money=["strike", "preco", "custo"]),
+                         hide_index=True, width="stretch", height=460)
+            st.caption("**mov_hoje**: quanto a ação precisa subir (call) ou cair (put) até o fechamento de hoje "
+                       "para a opção valer a meta, mantendo a IV. **prob_hoje / prob_venc**: chance estimada pela "
+                       "distribuição log-normal. **prob_lucro_venc**: chance de terminar acima do custo no vencimento. "
+                       "**retorno_esperado**: valor teórico com a vol escolhida ÷ preço − 1 (negativo = opção cara). "
+                       "Lote mínimo de 100 opções. Não considera spread do book, corretagem nem IR.")
+
+# ================================================================ 7. ajuda
+with aba[6]:
     st.markdown("""
 ### Fluxo sugerido
 1. **Volatilidade** — veja se a IV está cara ou barata vs. a histórica. Isso define o lado:
