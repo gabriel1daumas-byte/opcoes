@@ -159,3 +159,46 @@ def scanner_travas(df, S, du, r, sig, min_neg=10, faixa=0.2, max_larg=None):
         out["alerta"] = np.where((out["ganho_risco"] > 8) | (out["ganho_risco"] < 1 / 8),
                                  "verificar book", "")
     return out
+
+
+# ---------------------------------------------------------------- alto risco / multiplicador
+def scanner_multiplicador(df, S, du, r, sig, capital, mult, min_neg=10, lote=100):
+    """Para cada opção: quanto a ação precisa andar para o prêmio multiplicar por `mult`
+    (hoje e no vencimento) e a probabilidade estimada disso, com a vol `sig`."""
+    from scipy.optimize import brentq
+    from .bs import preco_bs
+    T = max(du, 1) / DIAS_ANO
+    T1 = max(du - 1, 0) / DIAS_ANO            # valor no fechamento de hoje
+    sd_dia = sig / np.sqrt(DIAS_ANO)
+    x = df[(df["negocios"] >= min_neg) & (df["preco"] > 0) & df["iv"].notna()]
+    linhas = []
+    for _, o in x.iterrows():
+        K, p, t, iv = o["strike"], o["preco"], o["tipo"], o["iv"]
+        alvo = mult * p
+        call = t == "CALL"
+        # --- no vencimento
+        s_venc = K + alvo if call else K - alvo
+        if s_venc <= 0:
+            continue
+        z = (np.log(s_venc / S) - (r - 0.5 * sig ** 2) * T) / (sig * np.sqrt(T))
+        prob_venc = 1 - norm.cdf(z) if call else norm.cdf(z)
+        be = K + p if call else K - p
+        zb = (np.log(max(be, 1e-9) / S) - (r - 0.5 * sig ** 2) * T) / (sig * np.sqrt(T))
+        prob_lucro = 1 - norm.cdf(zb) if call else norm.cdf(zb)
+        # --- hoje (fechamento): preço da ação que faz a opção valer `alvo`, mantendo a IV
+        f = lambda s: preco_bs(s, K, T1, r, iv, t) - alvo
+        try:
+            s_hoje = brentq(f, S, S * 4) if call else brentq(f, S * 0.01, S)
+            zh = np.log(s_hoje / S) / sd_dia
+            prob_hoje = 1 - norm.cdf(zh) if call else norm.cdf(zh)
+        except ValueError:
+            s_hoje, prob_hoje = np.nan, 0.0
+        qtd = int(capital // (p * lote)) * lote
+        valor_justo = preco_bs(S, K, T, r, sig, t)
+        linhas.append(dict(
+            codigo=o["codigo"], tipo=t, strike=K, preco=p, negocios=o["negocios"], iv=iv,
+            qtd=qtd, custo=qtd * p,
+            mov_hoje=s_hoje / S - 1 if np.isfinite(s_hoje) else np.nan, prob_hoje=prob_hoje,
+            mov_venc=s_venc / S - 1, prob_venc=prob_venc, prob_lucro_venc=prob_lucro,
+            retorno_esperado=valor_justo / p - 1))
+    return pd.DataFrame(linhas)
